@@ -1,0 +1,28 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#5AC8FA" />
+      <stop offset="100%" stopColor="#007AFF" />
+    </linearGradient>
+    <linearGradient id="faceL" x1="0" y1="0" x2="32" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#A8DAFF" />
+      <stop offset="100%" stopColor="#5AC8FA" />
+    </linearGradient>
+    <linearGradient id="faceR" x1="32" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#007AFF" />
+      <stop offset="100%" stopColor="#005EC4" />
+    </linearGradient>
+    <clipPath id="leftHalf"><rect x="0" y="0" width="32" height="64" /></clipPath>
+    <clipPath id="rightHalf"><rect x="32" y="0" width="32" height="64" /></clipPath>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)" />
+  <ellipse cx="32" cy="37" rx="19" ry="18" fill="url(#faceL)" clipPath="url(#leftHalf)" />
+  <ellipse cx="32" cy="37" rx="19" ry="18" fill="url(#faceR)" clipPath="url(#rightHalf)" />
+  <line x1="32" y1="19" x2="32" y2="55" stroke="white" strokeWidth="1.2" strokeOpacity="0.3" />
+  <circle cx="23.5" cy="31" r="4.5" fill="white" />
+  <circle cx="23.5" cy="31" r="2" fill="#1a1a2e" />
+  <circle cx="40.5" cy="31" r="4.5" fill="white" fillOpacity="0.9" />
+  <circle cx="40.5" cy="31" r="2" fill="#1a1a2e" />
+  <path d="M 18 42 Q 24 51 32 51" stroke="white" strokeWidth="2.5" strokeLinecap="round" fill="none" strokeOpacity="0.95" />
+  <path d="M 32 51 Q 40 51 46 42" stroke="white" strokeWidth="2.5" strokeLinecap="round" fill="none" strokeOpacity="0.75" />
+</svg>
