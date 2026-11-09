@@ -7,7 +7,12 @@ A modern, minimalist, Apple Finder-inspired local file manager built for Windows
 ## 📥 How to Download and Run on Any Laptop
 
 ### Prerequisites
-- Install **Node.js** (v18 or higher) from **[https://nodejs.org/](https://nodejs.org/)** (free, one-time install).
+Install **Node.js** (v18 or higher):
+- **From Command Prompt / PowerShell (Quickest)**:
+  ```cmd
+  winget install OpenJS.NodeJS.LTS
+  ```
+- **Or from browser**: Download installer from **[https://nodejs.org/](https://nodejs.org/)**.
 
 ---
 
