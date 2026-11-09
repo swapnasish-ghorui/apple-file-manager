@@ -11,7 +11,9 @@ import { ContextMenu } from "./components/ContextMenu";
 import { PDFViewer } from "./components/PDFViewer";
 import { WordViewer } from "./components/WordViewer";
 import { PresentationViewer } from "./components/PresentationViewer";
-import { MediaViewer } from "./components/MediaViewer";
+import { VideoPlayer } from "./components/VideoPlayer";
+import { PhotoAnnotator } from "./components/PhotoAnnotator";
+import { R2SettingsModal } from "./components/R2SettingsModal";
 import {
   getSystemInfo,
   getFiles,
@@ -22,18 +24,35 @@ import {
   openNativeApp,
   revealInExplorer,
   toggleFavorite,
+  uploadToR2,
+  createCloudFolder,
+  deleteCloudItem,
+  getR2Config,
+  getR2Stats,
 } from "./services/api";
+import type { R2Config, R2StorageStats } from "./services/api";
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Breadcrumb Generator ────────────────────────────────────────────────────
 
 function buildBreadcrumbs(currentPath: string): { label: string; path: string }[] {
-  if (!currentPath || currentPath === "/" || currentPath === "/Home") {
-    return [{ label: "Home", path: "/" }];
+  if (!currentPath || currentPath === "/" || currentPath === "r2://" || currentPath === "r2:") {
+    return [{ label: "R2 Cloud Drive", path: "r2://" }];
   }
 
-  // Windows paths: e.g. C:\Users\MOON\Documents
+  if (currentPath.startsWith("r2://")) {
+    const sub = currentPath.replace(/^r2:\/\//, "");
+    const parts = sub.split("/").filter(Boolean);
+    const crumbs = [{ label: "R2 Cloud Drive", path: "r2://" }];
+    let accum = "r2://";
+    for (const part of parts) {
+      accum += (accum.endsWith("/") ? "" : "/") + part;
+      crumbs.push({ label: part, path: accum });
+    }
+    return crumbs;
+  }
+
   if (/^[a-zA-Z]:\\/i.test(currentPath) || /^[a-zA-Z]:\//i.test(currentPath)) {
-    const driveRoot = currentPath.substring(0, 3); // "C:\"
+    const driveRoot = currentPath.substring(0, 3);
     const crumbs = [{ label: driveRoot.replace(/\\|\//, ""), path: driveRoot }];
     const rest = currentPath.substring(3).split(/[\\/]/).filter(Boolean);
     let accum = driveRoot;
@@ -44,20 +63,11 @@ function buildBreadcrumbs(currentPath: string): { label: string; path: string }[
     return crumbs;
   }
 
-  // Fallback / mock paths
-  const parts = currentPath.split("/").filter(Boolean);
-  const crumbs = [{ label: "Home", path: "/" }];
-  let accum = "";
-  for (const part of parts) {
-    accum += "/" + part;
-    crumbs.push({ label: part, path: accum });
-  }
-  return crumbs;
+  return [{ label: "Home", path: currentPath }];
 }
 
 function sortFiles(files: FileItem[], key: SortKey, dir: SortDir): FileItem[] {
   return [...files].sort((a, b) => {
-    // Folders always first
     if (a.type === "folder" && b.type !== "folder") return -1;
     if (a.type !== "folder" && b.type === "folder") return 1;
 
@@ -83,14 +93,20 @@ function sortFiles(files: FileItem[], key: SortKey, dir: SortDir): FileItem[] {
 // ─── Main App ────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [currentPath, setCurrentPath] = useState("");
-  const [history, setHistory] = useState<string[]>([]);
-  const [historyIdx, setHistoryIdx] = useState(-1);
+  const [currentPath, setCurrentPath] = useState("r2://");
+  const [history, setHistory] = useState<string[]>(["r2://"]);
+  const [historyIdx, setHistoryIdx] = useState(0);
   const [items, setItems] = useState<FileItem[]>([]);
   const [locations, setLocations] = useState<SidebarItem[]>([]);
   const [drives, setDrives] = useState<{ path: string; label: string }[]>([]);
   const [favorites, setFavorites] = useState<string[]>([]);
 
+  // R2 State
+  const [r2Config, setR2Config] = useState<R2Config | null>(null);
+  const [r2Stats, setR2Stats] = useState<R2StorageStats | null>(null);
+  const [showR2Modal, setShowR2Modal] = useState(false);
+
+  // View state
   const [viewMode, setViewMode] = useState<ViewMode>("grid");
   const [selected, setSelected] = useState<string[]>([]);
   const [sortKey, setSortKey] = useState<SortKey>("name");
@@ -100,14 +116,16 @@ export default function App() {
   const [showInfo, setShowInfo] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
 
   // Viewers
   const [pdfFile, setPdfFile] = useState<FileItem | null>(null);
+  const [photoFile, setPhotoFile] = useState<FileItem | null>(null);
+  const [videoFile, setVideoFile] = useState<FileItem | null>(null);
   const [wordFile, setWordFile] = useState<FileItem | null>(null);
   const [presentationFile, setPresentationFile] = useState<FileItem | null>(null);
-  const [mediaFile, setMediaFile] = useState<FileItem | null>(null);
 
-  // Dialogs & Context Menu
+  // Dialogs
   const [contextMenu, setContextMenu] = useState<{ file: FileItem; x: number; y: number } | null>(null);
   const [promptModal, setPromptModal] = useState<{
     type: "newFolder" | "rename";
@@ -116,32 +134,28 @@ export default function App() {
   } | null>(null);
   const [promptInput, setPromptInput] = useState("");
 
-  // 1. Initial Load: System Info & Start Path
+  const isCloud = currentPath.startsWith("r2://") || currentPath.startsWith("cloud://");
+
+  // 1. Initial Load: System Info & R2 Config
+  const refreshCloudInfo = useCallback(() => {
+    getR2Config().then(setR2Config).catch(() => {});
+    getR2Stats().then(setR2Stats).catch(() => {});
+  }, []);
+
   useEffect(() => {
+    refreshCloudInfo();
     getSystemInfo()
       .then((info) => {
         setLocations(info.locations || []);
         setDrives(info.drives || []);
         setFavorites(info.favorites || []);
-
-        // Priority starting path: Documents -> Home -> C:\
-        const docLocation = info.locations?.find((l) => l.id === "documents");
-        const startPath = docLocation?.path || info.homedir || "C:\\";
-
-        setCurrentPath(startPath);
-        setHistory([startPath]);
-        setHistoryIdx(0);
       })
       .catch(() => {
-        // Fallback to mock data if backend not reachable yet
         setItems(MOCK_FILES);
-        setCurrentPath("/");
-        setHistory(["/"]);
-        setHistoryIdx(0);
       });
-  }, []);
+  }, [refreshCloudInfo]);
 
-  // 2. Load Directory Contents
+  // 2. Load Directory
   const loadDirectory = useCallback(
     async (dirPath: string) => {
       if (!dirPath) return;
@@ -162,9 +176,7 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (currentPath) {
-      loadDirectory(currentPath);
-    }
+    loadDirectory(currentPath);
   }, [currentPath, loadDirectory]);
 
   // 3. Navigation Controls
@@ -211,6 +223,14 @@ export default function App() {
         case "pdf":
           setPdfFile(file);
           break;
+        case "image":
+          // Open Comprehensive Photo Annotator
+          setPhotoFile(file);
+          break;
+        case "video":
+          // Open Direct Streaming Video Player
+          setVideoFile(file);
+          break;
         case "document":
         case "word":
           setWordFile(file);
@@ -218,28 +238,76 @@ export default function App() {
         case "presentation":
           setPresentationFile(file);
           break;
-        case "image":
-        case "video":
-        case "audio":
-          setMediaFile(file);
-          break;
         default:
-          // Try native system open
-          openNativeApp(file.path).catch(() => {});
+          if (!file.path.startsWith("r2://")) {
+            openNativeApp(file.path).catch(() => {});
+          }
           break;
       }
     },
     [navigate]
   );
 
-  // 5. File Operations
+  // 5. Upload Handling (Single or Multiple Files)
+  const handleUploadFiles = async (files: FileList | File[]) => {
+    setIsLoading(true);
+    setStatusMessage("Uploading to Cloudflare R2...");
+    try {
+      const fileArray = Array.from(files);
+      for (const file of fileArray) {
+        await uploadToR2(currentPath, file);
+      }
+      await loadDirectory(currentPath);
+      refreshCloudInfo();
+      setStatusMessage(`Successfully uploaded ${fileArray.length} file(s) to cloud.`);
+      setTimeout(() => setStatusMessage(null), 3000);
+    } catch (err: any) {
+      alert(`Upload error: ${err.message}`);
+      setStatusMessage(null);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Drag & Drop
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleUploadFiles(e.dataTransfer.files);
+    }
+  };
+
+  // 6. File Operations
   const handleCreateFolder = async (folderName: string) => {
     if (!folderName.trim()) return;
     try {
-      await createFolder(currentPath, folderName.trim());
+      if (isCloud) {
+        const fullCloudPath = currentPath.replace(/^r2:\/\//, "") + (currentPath.endsWith("/") || currentPath === "r2://" ? "" : "/") + folderName.trim();
+        await createCloudFolder(fullCloudPath);
+      } else {
+        await createFolder(currentPath, folderName.trim());
+      }
       await loadDirectory(currentPath);
+      refreshCloudInfo();
     } catch (err: any) {
       alert(`Error creating folder: ${err.message}`);
+    }
+  };
+
+  const handleDeleteItem = async (file: FileItem) => {
+    if (confirm(`Are you sure you want to delete "${file.name}"?`)) {
+      try {
+        if (file.path.startsWith("r2://") || isCloud) {
+          await deleteCloudItem(file.path);
+        } else {
+          await deleteItem(file.path);
+        }
+        await loadDirectory(currentPath);
+        refreshCloudInfo();
+      } catch (err: any) {
+        alert(`Error deleting item: ${err.message}`);
+      }
     }
   };
 
@@ -250,17 +318,6 @@ export default function App() {
       await loadDirectory(currentPath);
     } catch (err: any) {
       alert(`Error renaming item: ${err.message}`);
-    }
-  };
-
-  const handleDeleteItem = async (file: FileItem) => {
-    if (confirm(`Are you sure you want to delete "${file.name}"?`)) {
-      try {
-        await deleteItem(file.path);
-        await loadDirectory(currentPath);
-      } catch (err: any) {
-        alert(`Error deleting item: ${err.message}`);
-      }
     }
   };
 
@@ -280,12 +337,10 @@ export default function App() {
       setItems((prev) =>
         prev.map((it) => (it.path === file.path ? { ...it, isFavorite: !it.isFavorite } : it))
       );
-    } catch {
-      // Ignored
-    }
+    } catch {}
   };
 
-  // 6. Selection & Sorting
+  // 7. Selection & Sorting
   const handleSelect = useCallback((id: string, multi: boolean) => {
     setSelected((prev) => {
       if (multi) {
@@ -307,7 +362,6 @@ export default function App() {
     [sortKey]
   );
 
-  // 7. Filtered & Sorted list
   const filteredAndSorted = useMemo(() => {
     let result = items;
     if (searchQuery.trim()) {
@@ -327,41 +381,58 @@ export default function App() {
   // 8. Keyboard Shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (promptModal) return; // Don't intercept while typing in modal
-
+      if (promptModal) return;
       if (e.key === "Escape") {
         if (pdfFile) { setPdfFile(null); return; }
+        if (photoFile) { setPhotoFile(null); return; }
+        if (videoFile) { setVideoFile(null); return; }
         if (wordFile) { setWordFile(null); return; }
         if (presentationFile) { setPresentationFile(null); return; }
-        if (mediaFile) { setMediaFile(null); return; }
         setContextMenu(null);
         setSelected([]);
       }
-      if ((e.metaKey || e.ctrlKey) && e.key === "[") {
-        goBack();
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === "]") {
-        goForward();
-      }
-      if (e.key === "Enter" && selectedFile) {
-        handleOpen(selectedFile);
-      }
-      if (e.key === " " && selectedFile && !pdfFile && !wordFile && !presentationFile && !mediaFile) {
+      if ((e.metaKey || e.ctrlKey) && e.key === "[") goBack();
+      if ((e.metaKey || e.ctrlKey) && e.key === "]") goForward();
+      if (e.key === "Enter" && selectedFile) handleOpen(selectedFile);
+      if (e.key === " " && selectedFile && !pdfFile && !photoFile && !videoFile && !wordFile && !presentationFile) {
         handleOpen(selectedFile);
         e.preventDefault();
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [pdfFile, wordFile, presentationFile, mediaFile, selectedFile, promptModal, goBack, goForward, handleOpen]);
+  }, [pdfFile, photoFile, videoFile, wordFile, presentationFile, selectedFile, promptModal, goBack, goForward, handleOpen]);
 
   return (
     <div className="flex flex-col h-screen overflow-hidden text-white" style={{ background: "#1c1c1e" }}>
       {/* Title Bar with Apple Finder Two-Tone Logo */}
-      <TitleBar title={breadcrumbs[breadcrumbs.length - 1]?.label || "Finder"} />
+      <TitleBar title={breadcrumbs[breadcrumbs.length - 1]?.label || "R2 Cloud Drive"} />
 
       {/* Main Body */}
-      <div className="flex flex-1 overflow-hidden" onClick={() => setContextMenu(null)}>
+      <div
+        className="flex flex-1 overflow-hidden relative"
+        onClick={() => setContextMenu(null)}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragOver(true);
+        }}
+        onDragLeave={() => setIsDragOver(false)}
+        onDrop={handleDrop}
+      >
+        {/* Drag and Drop Overlay */}
+        {isDragOver && (
+          <div
+            className="absolute inset-0 z-40 flex flex-col items-center justify-center pointer-events-none"
+            style={{ background: "rgba(14, 165, 233, 0.25)", backdropFilter: "blur(6px)" }}
+          >
+            <div className="p-8 rounded-3xl bg-black/80 border-2 border-dashed border-sky-400 flex flex-col items-center gap-3 shadow-2xl">
+              <span className="text-5xl animate-bounce">☁️</span>
+              <p className="text-base font-bold text-white">Drop files here to upload to Cloudflare R2</p>
+              <p className="text-xs text-white/50">{currentPath}</p>
+            </div>
+          </div>
+        )}
+
         {/* Sidebar */}
         <Sidebar
           currentPath={currentPath}
@@ -369,11 +440,14 @@ export default function App() {
           favorites={favorites}
           locations={locations}
           drives={drives}
+          r2Config={r2Config}
+          r2Stats={r2Stats}
+          onOpenR2Settings={() => setShowR2Modal(true)}
         />
 
         {/* Content Area */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          {/* Finder Toolbar */}
+          {/* Finder Toolbar with Cloud Upload */}
           <Toolbar
             breadcrumbs={breadcrumbs}
             onNavigate={navigate}
@@ -392,30 +466,43 @@ export default function App() {
               setPromptInput("New Folder");
               setPromptModal({ type: "newFolder", defaultValue: "New Folder" });
             }}
-            onRefresh={() => loadDirectory(currentPath)}
+            onRefresh={() => {
+              loadDirectory(currentPath);
+              refreshCloudInfo();
+            }}
             showHidden={showHidden}
             onToggleHidden={() => setShowHidden((v) => !v)}
+            onUpload={handleUploadFiles}
+            onOpenR2Settings={() => setShowR2Modal(true)}
+            isCloud={isCloud}
           />
 
-          {/* Status Sub-bar */}
+          {/* Cloud Status Sub-bar */}
           <div
-            className="h-7 flex items-center justify-between px-4 border-b border-white/[0.04] text-[11px] text-white/35 flex-shrink-0"
+            className="h-7 flex items-center justify-between px-4 border-b border-white/[0.04] text-[11px] text-white/40 flex-shrink-0"
             style={{ background: "rgba(30,30,32,0.7)" }}
           >
-            <span>
-              {isLoading ? "Reading disk…" : `${filteredAndSorted.length} items`}
-              {selected.length > 0 && ` · ${selected.length} selected`}
-            </span>
+            <div className="flex items-center gap-2">
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  r2Config?.isConfigured ? "bg-emerald-400" : "bg-sky-400"
+                }`}
+              />
+              <span>
+                {isLoading ? "Reading storage…" : `${filteredAndSorted.length} items`}
+                {selected.length > 0 && ` · ${selected.length} selected`}
+              </span>
+            </div>
             <span className="font-mono truncate max-w-sm">{currentPath}</span>
           </div>
 
-          {/* Error notice if directory failed */}
+          {/* Status Message */}
           {statusMessage && (
-            <div className="p-3 bg-red-500/10 border-b border-red-500/20 text-red-300 text-xs flex items-center justify-between">
+            <div className="px-4 py-2 bg-sky-500/10 border-b border-sky-500/20 text-sky-300 text-xs flex items-center justify-between">
               <span>{statusMessage}</span>
               <button
                 onClick={() => setStatusMessage(null)}
-                className="text-red-400 hover:text-white text-xs underline"
+                className="text-sky-400 hover:text-white text-xs underline"
               >
                 Dismiss
               </button>
@@ -423,10 +510,7 @@ export default function App() {
           )}
 
           {/* File Grid / List */}
-          <div
-            className="flex-1 overflow-y-auto"
-            onClick={() => setSelected([])}
-          >
+          <div className="flex-1 overflow-y-auto" onClick={() => setSelected([])}>
             {viewMode === "grid" ? (
               <FileGrid
                 files={filteredAndSorted}
@@ -456,7 +540,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Info / Metadata Inspector Panel */}
+        {/* Info Panel */}
         {showInfo && (
           <InfoPanel
             file={selectedFile}
@@ -475,8 +559,8 @@ export default function App() {
           onPreview={() => handleOpen(contextMenu.file)}
           onToggleFavorite={() => handleToggleFavorite(contextMenu.file)}
           onDelete={() => handleDeleteItem(contextMenu.file)}
-          onOpenNative={() => openNativeApp(contextMenu.file.path)}
-          onRevealInExplorer={() => revealInExplorer(contextMenu.file.path)}
+          onOpenNative={!isCloud ? () => openNativeApp(contextMenu.file.path) : undefined}
+          onRevealInExplorer={!isCloud ? () => revealInExplorer(contextMenu.file.path) : undefined}
           onDuplicate={() => handleDuplicateItem(contextMenu.file)}
           onRename={() => {
             setPromptInput(contextMenu.file.name);
@@ -490,27 +574,51 @@ export default function App() {
         />
       )}
 
-      {/* Built-in PDF Viewer with Highlighting & Autosave */}
+      {/* ── Built-in Viewers ─────────────────────────────────────────────────── */}
+
+      {/* Comprehensive PDF Annotator */}
       {pdfFile && (
         <PDFViewer file={pdfFile} onClose={() => setPdfFile(null)} />
       )}
 
-      {/* Built-in Word Document Viewer */}
+      {/* Comprehensive Photo / Image Markup Annotator */}
+      {photoFile && (
+        <PhotoAnnotator
+          file={photoFile}
+          onClose={() => setPhotoFile(null)}
+          onSaved={() => {
+            loadDirectory(currentPath);
+            refreshCloudInfo();
+          }}
+        />
+      )}
+
+      {/* Direct Video Streaming Player with Seeking & Speeds */}
+      {videoFile && (
+        <VideoPlayer file={videoFile} onClose={() => setVideoFile(null)} />
+      )}
+
+      {/* Word Document Viewer */}
       {wordFile && (
         <WordViewer file={wordFile} onClose={() => setWordFile(null)} />
       )}
 
-      {/* Built-in PowerPoint Presentation Viewer */}
+      {/* PowerPoint Presentation Viewer */}
       {presentationFile && (
         <PresentationViewer file={presentationFile} onClose={() => setPresentationFile(null)} />
       )}
 
-      {/* Media Viewer (Images, Audio, Video) */}
-      {mediaFile && (
-        <MediaViewer file={mediaFile} onClose={() => setMediaFile(null)} />
-      )}
+      {/* Cloudflare R2 Connection Settings Modal */}
+      <R2SettingsModal
+        isOpen={showR2Modal}
+        onClose={() => setShowR2Modal(false)}
+        onUpdated={() => {
+          refreshCloudInfo();
+          loadDirectory(currentPath);
+        }}
+      />
 
-      {/* Clean Apple-style Prompt Modal (New Folder / Rename) */}
+      {/* Prompt Modal (New Folder / Rename) */}
       {promptModal && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4"

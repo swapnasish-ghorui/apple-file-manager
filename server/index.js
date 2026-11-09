@@ -7,6 +7,20 @@ import os from "os";
 import { exec } from "child_process";
 import multer from "multer";
 import AdmZip from "adm-zip";
+import dotenv from "dotenv";
+dotenv.config();
+
+import {
+  getR2Config,
+  updateR2Config,
+  testR2Connection,
+  listCloudFiles,
+  getCloudFileStream,
+  uploadCloudFile,
+  createCloudFolder,
+  deleteCloudItem,
+  getCloudStorageStats,
+} from "./r2.js";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -21,6 +35,7 @@ if (!fs.existsSync(APP_DATA_DIR)) {
 }
 
 const ANNOTATIONS_FILE = path.join(APP_DATA_DIR, "annotations.json");
+const PHOTO_ANNOTATIONS_FILE = path.join(APP_DATA_DIR, "photo-annotations.json");
 const FAVORITES_FILE = path.join(APP_DATA_DIR, "favorites.json");
 
 function loadJson(file, fallback = {}) {
@@ -42,17 +57,8 @@ function saveJson(file, data) {
   }
 }
 
-// ─── Multer Upload Config ────────────────────────────────────────────────────
-const uploadStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dest = req.query.dest || os.homedir();
-    cb(null, dest);
-  },
-  filename: (req, file, cb) => {
-    cb(null, file.originalname);
-  },
-});
-const upload = multer({ storage: uploadStorage });
+// ─── Multer In-Memory for R2 & Disk for Local ────────────────────────────────
+const memoryUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } }); // 500MB max per upload
 
 // ─── Helper: Detect File Type ────────────────────────────────────────────────
 function getFileType(fileName, isDir) {
@@ -60,8 +66,7 @@ function getFileType(fileName, isDir) {
   const ext = path.extname(fileName).toLowerCase().replace(".", "");
 
   switch (ext) {
-    case "pdf":
-      return "pdf";
+    case "pdf": return "pdf";
     case "doc":
     case "docx":
     case "rtf":
@@ -111,25 +116,10 @@ function getFileType(fileName, isDir) {
     case "css":
     case "py":
     case "json":
-    case "rs":
-    case "go":
-    case "c":
-    case "cpp":
-    case "h":
-    case "cs":
-    case "java":
-    case "sh":
-    case "bat":
-    case "ps1":
       return "code";
     case "txt":
     case "md":
     case "log":
-    case "env":
-    case "yml":
-    case "yaml":
-    case "ini":
-    case "conf":
       return "text";
     default:
       return "unknown";
@@ -149,19 +139,193 @@ function getMimeType(filePath) {
     ".mp4": "video/mp4",
     ".webm": "video/webm",
     ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska",
     ".mp3": "audio/mpeg",
     ".wav": "audio/wav",
     ".ogg": "audio/ogg",
     ".txt": "text/plain; charset=utf-8",
     ".json": "application/json",
-    ".html": "text/html",
-    ".css": "text/css",
-    ".js": "text/javascript",
   };
   return map[ext] || "application/octet-stream";
 }
 
-// ─── Windows Available Drives ────────────────────────────────────────────────
+// ─── CLOUDFLARE R2 VIRTUAL STORAGE API ────────────────────────────────────────
+
+// 1. R2 Config & Status
+app.get("/api/r2/config", (req, res) => {
+  res.json(getR2Config());
+});
+
+app.post("/api/r2/config", async (req, res) => {
+  const result = await updateR2Config(req.body);
+  res.json(result);
+});
+
+app.post("/api/r2/test", async (req, res) => {
+  const result = await testR2Connection();
+  res.json(result);
+});
+
+// 2. Storage Stats
+app.get("/api/r2/stats", async (req, res) => {
+  try {
+    const stats = await getCloudStorageStats();
+    res.json(stats);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. List Cloud Files & Folders
+app.get("/api/r2/files", async (req, res) => {
+  const prefix = req.query.prefix || "";
+  try {
+    const data = await listCloudFiles(String(prefix));
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. Stream Cloud File (Photos, Video, Audio, PDF) with HTTP Range Support
+app.get("/api/r2/raw", async (req, res) => {
+  const key = req.query.key ? String(req.query.key) : "";
+  if (!key) return res.status(400).send("Key required");
+
+  try {
+    const rangeHeader = req.headers.range;
+    const result = await getCloudFileStream(key, rangeHeader);
+
+    const headers = {
+      "Content-Type": result.contentType || getMimeType(key),
+      "Accept-Ranges": result.acceptRanges || "bytes",
+    };
+
+    if (result.contentLength) {
+      headers["Content-Length"] = result.contentLength;
+    }
+    if (result.contentRange) {
+      headers["Content-Range"] = result.contentRange;
+    }
+
+    if (rangeHeader && (result.contentRange || result.isPartial)) {
+      res.writeHead(206, headers);
+    } else {
+      res.writeHead(200, headers);
+    }
+
+    result.stream.pipe(res);
+  } catch (err) {
+    res.status(500).send(`Error reading file: ${err.message}`);
+  }
+});
+
+// 5. Upload File to Cloudflare R2
+app.post("/api/r2/upload", memoryUpload.single("file"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "No file provided" });
+  }
+
+  const prefix = req.query.prefix ? String(req.query.prefix).replace(/^\/+/, "") : "";
+  const key = prefix ? `${prefix.replace(/\/$/, "")}/${req.file.originalname}` : req.file.originalname;
+
+  try {
+    await uploadCloudFile(key, req.file.buffer, req.file.mimetype);
+    res.json({
+      success: true,
+      key,
+      name: req.file.originalname,
+      size: req.file.size,
+    });
+  } catch (err) {
+    res.status(500).json({ error: `Upload failed: ${err.message}` });
+  }
+});
+
+// 6. Create Virtual Folder in R2
+app.post("/api/r2/folder", async (req, res) => {
+  const { path: folderPath } = req.body;
+  if (!folderPath) return res.status(400).json({ error: "Path required" });
+  try {
+    await createCloudFolder(folderPath);
+    res.json({ success: true, path: folderPath });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 7. Delete Item / Folder in R2
+app.post("/api/r2/delete", async (req, res) => {
+  const { key } = req.body;
+  if (!key) return res.status(400).json({ error: "Key required" });
+  try {
+    await deleteCloudItem(key);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── ANNOTATIONS API (For both PDF & Photos) ──────────────────────────────────
+
+// PDF Annotations
+app.get("/api/annotations", (req, res) => {
+  const filePath = req.query.path ? String(req.query.path) : "";
+  if (!filePath) return res.status(400).json({ error: "Path query param required" });
+  const allAnnotations = loadJson(ANNOTATIONS_FILE, {});
+  const highlights = allAnnotations[filePath] || [];
+  res.json({ path: filePath, highlights });
+});
+
+app.post("/api/annotations", (req, res) => {
+  const { path: filePath, highlights } = req.body;
+  if (!filePath || !Array.isArray(highlights)) {
+    return res.status(400).json({ error: "path and highlights array required" });
+  }
+  const allAnnotations = loadJson(ANNOTATIONS_FILE, {});
+  allAnnotations[filePath] = highlights;
+  saveJson(ANNOTATIONS_FILE, allAnnotations);
+  res.json({ success: true, count: highlights.length });
+});
+
+// Photo Annotations (drawings, callouts, text labels, shapes)
+app.get("/api/photo-annotations", (req, res) => {
+  const imagePath = req.query.path ? String(req.query.path) : "";
+  if (!imagePath) return res.status(400).json({ error: "Path query param required" });
+  const all = loadJson(PHOTO_ANNOTATIONS_FILE, {});
+  const annotations = all[imagePath] || null;
+  res.json({ path: imagePath, annotations });
+});
+
+app.post("/api/photo-annotations", (req, res) => {
+  const { path: imagePath, annotations } = req.body;
+  if (!imagePath || !annotations) {
+    return res.status(400).json({ error: "path and annotations required" });
+  }
+  const all = loadJson(PHOTO_ANNOTATIONS_FILE, {});
+  all[imagePath] = annotations;
+  saveJson(PHOTO_ANNOTATIONS_FILE, all);
+  res.json({ success: true });
+});
+
+// Save annotated photo binary directly to R2 / local cloud
+app.post("/api/photo-annotations/save-image", express.json({ limit: "100mb" }), async (req, res) => {
+  const { key, base64Data } = req.body;
+  if (!key || !base64Data) {
+    return res.status(400).json({ error: "key and base64Data required" });
+  }
+
+  try {
+    const buffer = Buffer.from(base64Data.replace(/^data:image\/\w+;base64,/, ""), "base64");
+    await uploadCloudFile(key, buffer, "image/png");
+    res.json({ success: true, key });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── LOCAL SYSTEM / HYBRID ACCESS FALLBACKS ───────────────────────────────────
+
 function getWindowsDrives() {
   if (process.platform !== "win32") {
     return [{ path: "/", label: "Root (/)" }];
@@ -178,38 +342,23 @@ function getWindowsDrives() {
           letter,
         });
       }
-    } catch {
-      // Ignored
-    }
+    } catch {}
   }
   return drives.length > 0 ? drives : [{ path: "C:\\", label: "Windows (C:)" }];
 }
 
-// ─── API Routes ──────────────────────────────────────────────────────────────
-
-// 1. System Info & Standard Locations
 app.get("/api/system/info", (req, res) => {
   const home = os.homedir();
   const drives = getWindowsDrives();
-
   const standardDirs = [
-    { id: "home", label: "Home", icon: "home", path: home },
-    { id: "desktop", label: "Desktop", icon: "monitor", path: path.join(home, "Desktop") },
-    { id: "documents", label: "Documents", icon: "file-text", path: path.join(home, "Documents") },
-    { id: "downloads", label: "Downloads", icon: "download", path: path.join(home, "Downloads") },
-    { id: "pictures", label: "Pictures", icon: "image", path: path.join(home, "Pictures") },
-    { id: "music", label: "Music", icon: "music", path: path.join(home, "Music") },
-    { id: "videos", label: "Videos", icon: "video", path: path.join(home, "Videos") },
-  ].filter((item) => {
-    try {
-      return fs.existsSync(item.path);
-    } catch {
-      return false;
-    }
-  });
-
+    { id: "cloud", label: "Cloudflare R2", icon: "cloud", path: "r2://" },
+    { id: "documents", label: "Documents", icon: "file-text", path: "r2://Documents" },
+    { id: "photos", label: "Photos", icon: "image", path: "r2://Photos" },
+    { id: "videos", label: "Videos", icon: "video", path: "r2://Videos" },
+    { id: "annotated", label: "Annotated", icon: "edit-3", path: "r2://Annotated" },
+    { id: "home", label: "Local Home", icon: "home", path: home },
+  ];
   const favorites = loadJson(FAVORITES_FILE, []);
-
   res.json({
     username: os.userInfo().username,
     homedir: home,
@@ -220,44 +369,41 @@ app.get("/api/system/info", (req, res) => {
   });
 });
 
-// 2. Directory Listing
+// Local file listings
 app.get("/api/files", async (req, res) => {
-  let targetPath = req.query.path ? String(req.query.path) : os.homedir();
-  const showHidden = req.query.showHidden === "true";
+  const reqPath = req.query.path ? String(req.query.path) : "";
 
-  // Normalize path
-  try {
-    targetPath = path.resolve(targetPath);
-  } catch {
-    targetPath = os.homedir();
+  // If path is a virtual cloud path (r2://...)
+  if (reqPath.startsWith("r2://") || reqPath.startsWith("cloud://") || !reqPath || reqPath === "/") {
+    const prefix = reqPath.replace(/^(r2:\/\/|cloud:\/\/)/, "").replace(/^\/+/, "");
+    try {
+      const cloudData = await listCloudFiles(prefix);
+      return res.json({
+        currentPath: reqPath.startsWith("r2://") ? reqPath : `r2://${prefix}`,
+        parentPath: prefix ? (prefix.includes("/") ? `r2://${prefix.split("/").slice(0, -2).join("/")}` : "r2://") : null,
+        isRoot: !prefix,
+        items: cloudData.items,
+        isCloud: true,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message, items: [] });
+    }
   }
 
+  // Local filesystem
+  let targetPath = path.resolve(reqPath);
   try {
     const stat = await fsp.stat(targetPath);
     if (!stat.isDirectory()) {
-      return res.status(400).json({ error: "Provided path is not a directory" });
+      return res.status(400).json({ error: "Not a directory" });
     }
-
     const dirents = await fsp.readdir(targetPath, { withFileTypes: true });
     const favorites = loadJson(FAVORITES_FILE, []);
-
     const items = [];
 
     for (const ent of dirents) {
       const name = ent.name;
-
-      // Filter hidden/system files unless requested
-      const isHidden =
-        name.startsWith(".") ||
-        name.startsWith("$") ||
-        name.toLowerCase() === "desktop.ini" ||
-        name.toLowerCase() === "ntuser.dat" ||
-        name.toLowerCase().startsWith("ntuser.dat{") ||
-        name.toLowerCase().endsWith(".sys") ||
-        name.toLowerCase() === "thumbs.db";
-
-      if (!showHidden && isHidden) continue;
-
+      if (name.startsWith(".") || name.startsWith("$") || name.toLowerCase() === "desktop.ini") continue;
       const fullPath = path.join(targetPath, name);
       let size = 0;
       let modified = new Date();
@@ -265,412 +411,62 @@ app.get("/api/files", async (req, res) => {
       let isDir = ent.isDirectory();
 
       try {
-        const itemStat = await fsp.stat(fullPath);
-        size = itemStat.size;
-        modified = itemStat.mtime;
-        created = itemStat.birthtime;
-        isDir = itemStat.isDirectory();
-      } catch {
-        // Fallback if stat fails (e.g. permission)
-      }
-
-      const fileType = getFileType(name, isDir);
-      const ext = isDir ? "" : path.extname(name).replace(".", "").toLowerCase();
+        const st = await fsp.stat(fullPath);
+        size = st.size;
+        modified = st.mtime;
+        created = st.birthtime;
+        isDir = st.isDirectory();
+      } catch {}
 
       items.push({
         id: fullPath,
         name,
-        type: fileType,
+        type: getFileType(name, isDir),
         size: isDir ? undefined : size,
         modified,
         created,
         path: fullPath,
-        extension: ext,
+        extension: isDir ? "" : path.extname(name).replace(".", "").toLowerCase(),
         isFavorite: favorites.includes(fullPath),
         isDirectory: isDir,
-        isHidden,
       });
     }
 
-    // Determine parent path
     const parsed = path.parse(targetPath);
-    const isRoot = targetPath === parsed.root;
-    const parentPath = isRoot ? null : path.dirname(targetPath);
-
     res.json({
       currentPath: targetPath,
-      parentPath,
-      isRoot,
+      parentPath: targetPath === parsed.root ? null : path.dirname(targetPath),
+      isRoot: targetPath === parsed.root,
       items,
+      isCloud: false,
     });
   } catch (err) {
-    res.status(500).json({
-      error: `Cannot read directory: ${err.message}`,
-      currentPath: targetPath,
-      items: [],
-    });
+    res.status(500).json({ error: err.message, items: [] });
   }
 });
 
-// 3. Raw File Streaming (Images, PDF, Video, Audio) with HTTP Range Support
-app.get("/api/file/raw", async (req, res) => {
-  const filePath = req.query.path ? String(req.query.path) : "";
-  if (!filePath || !fs.existsSync(filePath)) {
-    return res.status(404).send("File not found");
-  }
-
-  try {
-    const stat = await fsp.stat(filePath);
-    if (stat.isDirectory()) {
-      return res.status(400).send("Path is a directory");
-    }
-
-    const mimeType = getMimeType(filePath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-
-    if (range) {
-      const parts = range.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunksize = end - start + 1;
-      const file = fs.createReadStream(filePath, { start, end });
-      const head = {
-        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-        "Accept-Ranges": "bytes",
-        "Content-Length": chunksize,
-        "Content-Type": mimeType,
-      };
-      res.writeHead(206, head);
-      file.pipe(res);
-    } else {
-      const head = {
-        "Content-Length": fileSize,
-        "Content-Type": mimeType,
-        "Accept-Ranges": "bytes",
-      };
-      res.writeHead(200, head);
-      fs.createReadStream(filePath).pipe(res);
-    }
-  } catch (err) {
-    res.status(500).send(`Error reading file: ${err.message}`);
-  }
-});
-
-// 4. Read Text / Code / Markdown
-app.get("/api/file/text", async (req, res) => {
-  const filePath = req.query.path ? String(req.query.path) : "";
-  if (!filePath || !fs.existsSync(filePath)) {
-    return res.status(404).json({ error: "File not found" });
-  }
-
-  try {
-    const stat = await fsp.stat(filePath);
-    if (stat.size > 5 * 1024 * 1024) {
-      return res.status(400).json({ error: "File is too large to preview (>5MB)" });
-    }
-    const content = await fsp.readFile(filePath, "utf8");
-    res.json({ content, size: stat.size, path: filePath });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 5. Word Document (.docx) Extraction
-app.get("/api/file/docx", async (req, res) => {
-  const filePath = req.query.path ? String(req.query.path) : "";
-  if (!filePath || !fs.existsSync(filePath)) {
-    return res.status(404).json({ error: "File not found" });
-  }
-
-  try {
-    const zip = new AdmZip(filePath);
-    const docEntry = zip.getEntry("word/document.xml");
-    if (!docEntry) {
-      return res.status(400).json({ error: "Invalid docx: document.xml not found" });
-    }
-
-    const xml = docEntry.getData().toString("utf8");
-
-    // Clean XML to extract paragraphs
-    const paragraphs = [];
-    const pMatches = xml.match(/<w:p[\s\S]*?<\/w:p>/g) || [];
-
-    for (const pXml of pMatches) {
-      // Check if it's a heading
-      const isHeading = /<w:pStyle\s+w:val="Heading1"/i.test(pXml)
-        ? "h1"
-        : /<w:pStyle\s+w:val="Heading2"/i.test(pXml)
-        ? "h2"
-        : /<w:pStyle\s+w:val="Heading3"/i.test(pXml)
-        ? "h3"
-        : null;
-
-      // Check if list item
-      const isList = /<w:numPr>/i.test(pXml);
-
-      // Extract text inside <w:t> tags
-      const textMatches = pXml.match(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g) || [];
-      const text = textMatches
-        .map((t) => t.replace(/<[^>]+>/g, ""))
-        .join("")
-        .trim();
-
-      if (text) {
-        paragraphs.push({
-          type: isHeading || (isList ? "li" : "p"),
-          text,
-        });
-      }
-    }
-
-    const title = path.basename(filePath, path.extname(filePath));
-    const wordCount = paragraphs.reduce((acc, p) => acc + p.text.split(/\s+/).length, 0);
-
-    res.json({
-      title,
-      paragraphs,
-      wordCount,
-    });
-  } catch (err) {
-    res.status(500).json({ error: `Cannot parse docx: ${err.message}` });
-  }
-});
-
-// 6. PowerPoint Presentation (.pptx) Extraction
-app.get("/api/file/pptx", async (req, res) => {
-  const filePath = req.query.path ? String(req.query.path) : "";
-  if (!filePath || !fs.existsSync(filePath)) {
-    return res.status(404).json({ error: "File not found" });
-  }
-
-  try {
-    const zip = new AdmZip(filePath);
-    const zipEntries = zip.getEntries();
-
-    // Find all slide entries
-    const slideEntries = zipEntries
-      .filter((e) => /^ppt\/slides\/slide\d+\.xml$/i.test(e.entryName))
-      .sort((a, b) => {
-        const numA = parseInt(a.entryName.match(/\d+/)[0], 10);
-        const numB = parseInt(b.entryName.match(/\d+/)[0], 10);
-        return numA - numB;
-      });
-
-    const slides = [];
-
-    for (let i = 0; i < slideEntries.length; i++) {
-      const entry = slideEntries[i];
-      const xml = entry.getData().toString("utf8");
-
-      // Extract all text inside <a:t>
-      const textMatches = xml.match(/<a:t>([\s\S]*?)<\/a:t>/g) || [];
-      const lines = textMatches.map((t) => t.replace(/<[^>]+>/g, "").trim()).filter(Boolean);
-
-      const title = lines[0] || `Slide ${i + 1}`;
-      const bullets = lines.slice(1);
-
-      slides.push({
-        index: i + 1,
-        title,
-        bullets,
-      });
-    }
-
-    res.json({
-      title: path.basename(filePath, path.extname(filePath)),
-      slideCount: slides.length,
-      slides,
-    });
-  } catch (err) {
-    res.status(500).json({ error: `Cannot parse pptx: ${err.message}` });
-  }
-});
-
-// 7. PDF Annotations (Autosaved to exact file path without duplicates)
-app.get("/api/annotations", (req, res) => {
-  const filePath = req.query.path ? String(req.query.path) : "";
-  if (!filePath) {
-    return res.status(400).json({ error: "Path query param required" });
-  }
-  const allAnnotations = loadJson(ANNOTATIONS_FILE, {});
-  const highlights = allAnnotations[filePath] || [];
-  res.json({ path: filePath, highlights });
-});
-
-app.post("/api/annotations", (req, res) => {
-  const { path: filePath, highlights } = req.body;
-  if (!filePath || !Array.isArray(highlights)) {
-    return res.status(400).json({ error: "path and highlights array required" });
-  }
-
-  const allAnnotations = loadJson(ANNOTATIONS_FILE, {});
-  allAnnotations[filePath] = highlights;
-  saveJson(ANNOTATIONS_FILE, allAnnotations);
-
-  res.json({ success: true, count: highlights.length });
-});
-
-app.delete("/api/annotations", (req, res) => {
-  const filePath = req.query.path ? String(req.query.path) : "";
-  if (!filePath) {
-    return res.status(400).json({ error: "Path required" });
-  }
-  const allAnnotations = loadJson(ANNOTATIONS_FILE, {});
-  delete allAnnotations[filePath];
-  saveJson(ANNOTATIONS_FILE, allAnnotations);
-  res.json({ success: true });
-});
-
-// 8. Open In Native Default Windows Program
+// Native operations
 app.post("/api/file/open-native", (req, res) => {
   const { path: targetPath } = req.body;
-  if (!targetPath || !fs.existsSync(targetPath)) {
-    return res.status(404).json({ error: "Path not found" });
-  }
-
+  if (!targetPath || !fs.existsSync(targetPath)) return res.status(404).json({ error: "Path not found" });
   const cmd = process.platform === "win32" ? `start "" "${targetPath}"` : `open "${targetPath}"`;
   exec(cmd, (err) => {
-    if (err) {
-      return res.status(500).json({ error: `Failed to open: ${err.message}` });
-    }
-    res.json({ success: true, message: "Opened in default application" });
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ success: true });
   });
 });
 
-// 9. Reveal in Windows File Explorer
 app.post("/api/file/reveal", (req, res) => {
   const { path: targetPath } = req.body;
-  if (!targetPath || !fs.existsSync(targetPath)) {
-    return res.status(404).json({ error: "Path not found" });
-  }
-
+  if (!targetPath || !fs.existsSync(targetPath)) return res.status(404).json({ error: "Path not found" });
   const cmd = process.platform === "win32" ? `explorer.exe /select,"${targetPath}"` : `open -R "${targetPath}"`;
   exec(cmd, (err) => {
-    if (err) {
-      return res.status(500).json({ error: `Failed to reveal: ${err.message}` });
-    }
+    if (err) return res.status(500).json({ error: err.message });
     res.json({ success: true });
   });
-});
-
-// 10. File Operations: Create Folder, Create File, Rename, Delete, Duplicate
-app.post("/api/folder/create", async (req, res) => {
-  const { parentPath, name } = req.body;
-  if (!parentPath || !name) {
-    return res.status(400).json({ error: "parentPath and name are required" });
-  }
-  const target = path.join(parentPath, name.trim());
-  try {
-    await fsp.mkdir(target, { recursive: false });
-    res.json({ success: true, path: target });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/api/file/create", async (req, res) => {
-  const { parentPath, name, content = "" } = req.body;
-  if (!parentPath || !name) {
-    return res.status(400).json({ error: "parentPath and name are required" });
-  }
-  const target = path.join(parentPath, name.trim());
-  try {
-    await fsp.writeFile(target, content, "utf8");
-    res.json({ success: true, path: target });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/api/file/rename", async (req, res) => {
-  const { oldPath, newName } = req.body;
-  if (!oldPath || !newName) {
-    return res.status(400).json({ error: "oldPath and newName are required" });
-  }
-  const dir = path.dirname(oldPath);
-  const target = path.join(dir, newName.trim());
-  try {
-    await fsp.rename(oldPath, target);
-    res.json({ success: true, oldPath, newPath: target });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/api/file/delete", async (req, res) => {
-  const { path: targetPath } = req.body;
-  if (!targetPath || !fs.existsSync(targetPath)) {
-    return res.status(404).json({ error: "Path does not exist" });
-  }
-  try {
-    await fsp.rm(targetPath, { recursive: true, force: true });
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/api/file/duplicate", async (req, res) => {
-  const { path: targetPath } = req.body;
-  if (!targetPath || !fs.existsSync(targetPath)) {
-    return res.status(404).json({ error: "Path does not exist" });
-  }
-  try {
-    const dir = path.dirname(targetPath);
-    const ext = path.extname(targetPath);
-    const base = path.basename(targetPath, ext);
-    let copyName = `${base} copy${ext}`;
-    let copyPath = path.join(dir, copyName);
-    let counter = 2;
-    while (fs.existsSync(copyPath)) {
-      copyName = `${base} copy ${counter}${ext}`;
-      copyPath = path.join(dir, copyName);
-      counter++;
-    }
-
-    const stat = await fsp.stat(targetPath);
-    if (stat.isDirectory()) {
-      await fsp.cp(targetPath, copyPath, { recursive: true });
-    } else {
-      await fsp.copyFile(targetPath, copyPath);
-    }
-    res.json({ success: true, newPath: copyPath });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 11. Pin / Unpin Favorites
-app.get("/api/favorites", (req, res) => {
-  const favorites = loadJson(FAVORITES_FILE, []);
-  res.json({ favorites });
-});
-
-app.post("/api/favorites/toggle", (req, res) => {
-  const { path: targetPath } = req.body;
-  if (!targetPath) {
-    return res.status(400).json({ error: "Path required" });
-  }
-  let favorites = loadJson(FAVORITES_FILE, []);
-  if (favorites.includes(targetPath)) {
-    favorites = favorites.filter((p) => p !== targetPath);
-  } else {
-    favorites.push(targetPath);
-  }
-  saveJson(FAVORITES_FILE, favorites);
-  res.json({ success: true, favorites });
-});
-
-// 12. Upload File
-app.post("/api/upload", upload.single("file"), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: "No file uploaded" });
-  }
-  res.json({ success: true, file: req.file });
 });
 
 // Start Server
 app.listen(PORT, () => {
-  console.log(`🍎 Apple File Manager Backend running at http://localhost:${PORT}`);
+  console.log(`☁️ Personal Cloud & R2 File Manager Backend running at http://localhost:${PORT}`);
 });

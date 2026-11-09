@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useRef } from "react";
 import {
   ChevronLeft,
   ChevronRight,
@@ -12,6 +12,8 @@ import {
   RotateCw,
   Eye,
   EyeOff,
+  UploadCloud,
+  Cloud,
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -37,6 +39,9 @@ interface ToolbarProps {
   onRefresh?: () => void;
   showHidden?: boolean;
   onToggleHidden?: () => void;
+  onUpload?: (files: FileList) => void;
+  onOpenR2Settings?: () => void;
+  isCloud?: boolean;
 }
 
 export const Toolbar: React.FC<ToolbarProps> = ({
@@ -57,9 +62,13 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onRefresh,
   showHidden = false,
   onToggleHidden,
+  onUpload,
+  onOpenR2Settings,
+  isCloud = false,
 }) => {
   const [showSort, setShowSort] = React.useState(false);
   const sortRef = React.useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   React.useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -106,8 +115,33 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         </button>
       </div>
 
-      {/* New Folder & Refresh */}
-      <div className="flex items-center gap-0.5 border-l border-white/10 pl-2">
+      {/* Cloud Actions (New Folder, Upload, Refresh) */}
+      <div className="flex items-center gap-1 border-l border-white/10 pl-2">
+        {onUpload && (
+          <>
+            <input
+              type="file"
+              ref={fileInputRef}
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                  onUpload(e.target.files);
+                  e.target.value = "";
+                }
+              }}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              title="Upload to Cloudflare R2 / Cloud Storage"
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold bg-sky-500/20 text-sky-400 hover:bg-sky-500 hover:text-white transition-all shadow-sm"
+            >
+              <UploadCloud size={14} />
+              Upload
+            </button>
+          </>
+        )}
+
         {onNewFolder && (
           <button
             onClick={onNewFolder}
@@ -117,6 +151,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             <FolderPlus size={15} />
           </button>
         )}
+
         {onRefresh && (
           <button
             onClick={onRefresh}
@@ -126,7 +161,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             <RotateCw size={14} />
           </button>
         )}
-        {onToggleHidden && (
+
+        {onToggleHidden && !isCloud && (
           <button
             onClick={onToggleHidden}
             title={showHidden ? "Hide Hidden Files" : "Show Hidden Files"}
@@ -143,7 +179,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
       </div>
 
       {/* Breadcrumbs */}
-      <div className="flex items-center gap-0 overflow-x-auto no-scrollbar flex-1 min-w-0 px-1">
+      <div className="flex items-center gap-0 overflow-x-auto no-scrollbar flex-1 min-w-0 px-2">
         {breadcrumbs.map((crumb, i) => (
           <React.Fragment key={crumb.path || i}>
             {i > 0 && (
@@ -165,7 +201,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
       </div>
 
       {/* Search */}
-      <div className="relative w-48 flex-shrink-0">
+      <div className="relative w-44 flex-shrink-0">
         <Search
           size={13}
           className="absolute left-2.5 top-1/2 -translate-y-1/2 text-white/35 pointer-events-none"
@@ -174,7 +210,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           type="text"
           value={searchQuery}
           onChange={(e) => onSearch(e.target.value)}
-          placeholder="Search folder…"
+          placeholder="Search files…"
           className="w-full h-7 pl-7 pr-3 text-xs rounded-lg bg-white/8 border border-white/8 text-white placeholder-white/30 outline-none focus:border-sky-500/50 focus:bg-white/10 transition-all"
         />
       </div>
@@ -237,6 +273,17 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           </div>
         )}
       </div>
+
+      {/* R2 Cloud Settings Button */}
+      {onOpenR2Settings && (
+        <button
+          onClick={onOpenR2Settings}
+          title="Cloudflare R2 Settings"
+          className="p-1.5 rounded-md text-orange-400 hover:text-orange-300 hover:bg-orange-500/15 transition-all"
+        >
+          <Cloud size={15} />
+        </button>
+      )}
     </div>
   );
 };
